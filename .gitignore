@@ -1,0 +1,10 @@
+build/
+*.elf
+*.dump
+*.o
+__pycache__/
+*.pyc
+logs/
+*.Zone.Identifier
+*:Zone.Identifier
+*.lnk

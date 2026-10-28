@@ -1,0 +1,12 @@
+// Copyright 2026 Dimosthenis Karamparpas
+// SPDX-License-Identifier: Apache-2.0
+
+{
+    // Image size in pixels, multiples of 16 (one 4:2:0 MCU)
+    width: 32,
+    height: 32,
+    // Seed of the synthetic test image (gradients, shapes and noise)
+    seed: 42,
+    // Optional: path to an image file to encode instead (requires Pillow)
+    image: ""
+}

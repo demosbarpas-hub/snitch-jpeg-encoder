@@ -1,0 +1,1315 @@
+From 06968203e725a84f750b2ed56a2ec1129d033d11 Mon Sep 17 00:00:00 2001
+From: Demos Barpas <267039613+demosbarpas-hub@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:41:55 +0000
+Subject: [PATCH] sw: Add baseline JPEG encoder kernel (misc/jpeg)
+
+Single-core baseline JPEG encoder (4:2:0, quality 50, standard Huffman
+tables) using SSR/ISSR streams, FREP and the copift FPU-to-integer queues.
+The DM core streams one 16x16 MCU at a time into TCDM and flushes the
+compressed bitstream to `jpeg_out` after each MCU.
+
+- datagen.py generates a deterministic synthetic RGB image (or loads an
+  image file) and declares the `jpeg_out`/`jpeg_size` output buffers.
+- verify.py compares the produced JFIF bitstream byte-for-byte with a
+  Python golden model of the encoder arithmetic.
+
+Developed as part of the diploma thesis "JPEG Compression on Low Power
+RISC-V" (University of Patras, 2026).
+---
+ make/sw.mk                                  |   1 +
+ sw/kernels/misc/jpeg/app.mk                 |  10 +
+ sw/kernels/misc/jpeg/data/params.json       |  12 +
+ sw/kernels/misc/jpeg/scripts/datagen.py     |  57 ++
+ sw/kernels/misc/jpeg/scripts/jpeg_golden.py | 250 +++++++++
+ sw/kernels/misc/jpeg/scripts/verify.py      |  49 ++
+ sw/kernels/misc/jpeg/src/jpeg.h             | 585 ++++++++++++++++++++
+ sw/kernels/misc/jpeg/src/main.c             | 246 ++++++++
+ test/run.yaml                               |   2 +
+ 9 files changed, 1212 insertions(+)
+ create mode 100644 sw/kernels/misc/jpeg/app.mk
+ create mode 100644 sw/kernels/misc/jpeg/data/params.json
+ create mode 100755 sw/kernels/misc/jpeg/scripts/datagen.py
+ create mode 100755 sw/kernels/misc/jpeg/scripts/jpeg_golden.py
+ create mode 100755 sw/kernels/misc/jpeg/scripts/verify.py
+ create mode 100644 sw/kernels/misc/jpeg/src/jpeg.h
+ create mode 100644 sw/kernels/misc/jpeg/src/main.c
+
+diff --git a/make/sw.mk b/make/sw.mk
+index 0be7258..36a0d52 100644
+--- a/make/sw.mk
++++ b/make/sw.mk
+@@ -101,6 +101,7 @@ SN_APPS += $(SN_ROOT)/sw/kernels/misc/kbpcpa
+ SN_APPS += $(SN_ROOT)/sw/kernels/misc/box3d1r
+ SN_APPS += $(SN_ROOT)/sw/kernels/misc/j3d27pt
+ SN_APPS += $(SN_ROOT)/sw/kernels/misc/sort
++SN_APPS += $(SN_ROOT)/sw/kernels/misc/jpeg
+ endif
+ 
+ # Include Makefile from each app subdirectory
+diff --git a/sw/kernels/misc/jpeg/app.mk b/sw/kernels/misc/jpeg/app.mk
+new file mode 100644
+index 0000000..50f2d69
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/app.mk
+@@ -0,0 +1,10 @@
++# Copyright 2026 Dimosthenis Karamparpas
++# SPDX-License-Identifier: Apache-2.0
++
++APP              := jpeg
++$(APP)_BUILD_DIR ?= $(SN_ROOT)/sw/kernels/misc/$(APP)/build
++SRC_DIR          := $(SN_ROOT)/sw/kernels/misc/$(APP)/src
++SRCS             := $(SRC_DIR)/main.c
++
++include $(SN_ROOT)/sw/kernels/datagen.mk
++include $(SN_ROOT)/sw/kernels/common.mk
+diff --git a/sw/kernels/misc/jpeg/data/params.json b/sw/kernels/misc/jpeg/data/params.json
+new file mode 100644
+index 0000000..b0902a4
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/data/params.json
+@@ -0,0 +1,12 @@
++// Copyright 2026 Dimosthenis Karamparpas
++// SPDX-License-Identifier: Apache-2.0
++
++{
++    // Image size in pixels, multiples of 16 (one 4:2:0 MCU)
++    width: 32,
++    height: 32,
++    // Seed of the synthetic test image (gradients, shapes and noise)
++    seed: 42,
++    // Optional: path to an image file to encode instead (requires Pillow)
++    image: ""
++}
+diff --git a/sw/kernels/misc/jpeg/scripts/datagen.py b/sw/kernels/misc/jpeg/scripts/datagen.py
+new file mode 100755
+index 0000000..1e11455
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/scripts/datagen.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++# Copyright 2026 Dimosthenis Karamparpas
++# SPDX-License-Identifier: Apache-2.0
++"""Generate the input image and output buffers for the JPEG kernel."""
++
++import numpy as np
++
++import snitch.util.sim.data_utils as du
++
++# AXI splits bursts crossing 4KB address boundaries
++BURST_ALIGNMENT = 4096
++
++
++def synthetic_image(width, height, seed):
++    """Deterministic RGB test image with smooth regions, edges and noise."""
++    rng = np.random.default_rng(seed)
++    y, x = np.mgrid[0:height, 0:width].astype(np.float64)
++    r = 128 + 100 * np.sin(2 * np.pi * x / width)
++    g = 255 * y / max(height - 1, 1)
++    b = 64 + 128 * ((x + y) / (width + height))
++    disc = (x - width / 2) ** 2 + (y - height / 2) ** 2 < (min(width, height) / 4) ** 2
++    r[disc], g[disc], b[disc] = 230, 40, 40
++    img = np.stack([r, g, b], axis=-1) + rng.normal(0, 6, (height, width, 3))
++    return np.clip(np.rint(img), 0, 255).astype(np.uint8)
++
++
++def load_image(path, width, height):
++    from PIL import Image
++    img = Image.open(path).convert('RGB').resize((width, height), Image.LANCZOS)
++    return np.asarray(img, dtype=np.uint8)
++
++
++class JpegDataGen(du.DataGen):
++
++    def emit_header(self, **kwargs):
++        header = [super().emit_header()]
++        width, height = kwargs['width'], kwargs['height']
++        assert width % 16 == 0 and height % 16 == 0, 'width and height must be multiples of 16'
++        if kwargs.get('image'):
++            image = load_image(kwargs['image'], width, height)
++        else:
++            image = synthetic_image(width, height, kwargs['seed'])
++        # Upper bound of the encoded size: raw size plus headers
++        max_out = width * height * 3 + 1024
++
++        header += [du.format_scalar_definition('uint32_t', 'img_width', width)]
++        header += [du.format_scalar_definition('uint32_t', 'img_height', height)]
++        header += [du.format_array_definition('uint8_t', 'image', image.flatten(),
++                   alignment=BURST_ALIGNMENT, section=kwargs['section'])]
++        header += [du.format_array_declaration('uint8_t', 'jpeg_out', [max_out],
++                   alignment=BURST_ALIGNMENT, section=kwargs['section'])]
++        header += [du.format_scalar_declaration('uint32_t', 'jpeg_size')]
++        return '\n\n'.join(header)
++
++
++if __name__ == '__main__':
++    JpegDataGen().main()
+diff --git a/sw/kernels/misc/jpeg/scripts/jpeg_golden.py b/sw/kernels/misc/jpeg/scripts/jpeg_golden.py
+new file mode 100755
+index 0000000..e68d78b
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/scripts/jpeg_golden.py
+@@ -0,0 +1,250 @@
++#!/usr/bin/env python3
++# Copyright 2026 Dimosthenis Karamparpas
++# SPDX-License-Identifier: Apache-2.0
++"""Golden model of the Snitch JPEG encoder (bit-exact with src/main.c).
++
++Mirrors the arithmetic of apps/naive/jpeg_naive.c (FP64, standard
++quality-50 tables, 4:2:0, baseline Huffman) so that its output can be
++compared byte-for-byte with the hex dump printed by the simulator.
++
++Usage:
++  jpeg_reference.py IMAGE.png -o out.jpg              # encode an image
++  jpeg_reference.py IMAGE.png --compare sim.log       # compare with a simulator log
++  jpeg_reference.py --header apps/common/image_data.h -o out.jpg
++"""
++import argparse
++import re
++import sys
++
++import numpy as np
++
++DCT_M = np.array([
++    [0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553],
++    [0.490393, 0.415735, 0.277785, 0.097545, -0.097545, -0.277785, -0.415735, -0.490393],
++    [0.461940, 0.191342, -0.191342, -0.461940, -0.461940, -0.191342, 0.191342, 0.461940],
++    [0.415735, -0.097545, -0.490393, -0.277785, 0.277785, 0.490393, 0.097545, -0.415735],
++    [0.353553, -0.353553, -0.353553, 0.353553, 0.353553, -0.353553, -0.353553, 0.353553],
++    [0.277785, -0.490393, 0.097545, 0.415735, -0.415735, -0.097545, 0.490393, -0.277785],
++    [0.191342, -0.461940, 0.461940, -0.191342, -0.191342, 0.461940, -0.461940, 0.191342],
++    [0.097545, -0.277785, 0.415735, -0.490393, 0.490393, -0.415735, 0.277785, -0.097545]])
++
++RECIP_LUM = np.array([
++    0.062500, 0.090909, 0.100000, 0.062500, 0.041667, 0.025000, 0.019608, 0.016393,
++    0.083333, 0.083333, 0.071429, 0.052632, 0.038462, 0.018182, 0.017544, 0.014493,
++    0.071429, 0.076923, 0.062500, 0.038462, 0.025000, 0.017544, 0.014493, 0.012048,
++    0.071429, 0.058824, 0.045455, 0.029412, 0.018182, 0.010417, 0.011364, 0.013158,
++    0.055556, 0.045455, 0.027027, 0.017857, 0.014706, 0.009009, 0.009709, 0.011236,
++    0.041667, 0.028571, 0.018182, 0.015625, 0.011364, 0.009434, 0.008850, 0.010101,
++    0.020408, 0.015625, 0.012500, 0.011111, 0.009174, 0.007812, 0.007752, 0.009259,
++    0.013889, 0.010870, 0.010526, 0.010309, 0.009009, 0.007937, 0.008065, 0.009434])
++RECIP_CHR = np.array([
++    0.058824, 0.055556, 0.041667, 0.021277] + [0.010101] * 4 + [
++    0.055556, 0.047619, 0.038462, 0.015152] + [0.010101] * 4 + [
++    0.041667, 0.038462, 0.017857] + [0.010101] * 5 + [
++    0.021277, 0.015152] + [0.010101] * 6 + [0.010101] * 32)
++
++Q_LUM = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
++         14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
++         18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
++         49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
++Q_CHR = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99,
++         24, 26, 56, 99, 99, 99, 99, 99, 47, 66] + [99] * 38
++
++ZIGZAG = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
++          12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
++          35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++          58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
++
++DC_LUM_BITS = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
++DC_CHR_BITS = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
++DC_VALS = list(range(12))
++AC_LUM_BITS = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125]
++AC_CHR_BITS = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119]
++AC_LUM_VALS = bytes.fromhex(
++    "01020300041105122131410613516107227114328191a1082342b1c11552d1f0"
++    "2433627282090a161718191a25262728292a3435363738393a43444546474849"
++    "4a535455565758595a636465666768696a737475767778797a83848586878889"
++    "8a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5"
++    "c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8"
++    "f9fa")
++AC_CHR_VALS = bytes.fromhex(
++    "000102031104052131061241510761711322328108144291a1b1c109233352f0"
++    "156272d10a162434e125f11718191a262728292a35363738393a434445464748"
++    "494a535455565758595a636465666768696a737475767778797a828384858687"
++    "88898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3"
++    "c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8"
++    "f9fa")
++
++
++def build_codes(bits, vals):
++    """Canonical Huffman code assignment (JPEG Annex C)."""
++    table, code, k = {}, 0, 0
++    for length in range(1, 17):
++        for _ in range(bits[length - 1]):
++            table[vals[k]] = (code, length)
++            code += 1
++            k += 1
++        code <<= 1
++    return table
++
++
++DC_LUM = build_codes(DC_LUM_BITS, DC_VALS)
++DC_CHR = build_codes(DC_CHR_BITS, DC_VALS)
++AC_LUM = build_codes(AC_LUM_BITS, AC_LUM_VALS)
++AC_CHR = build_codes(AC_CHR_BITS, AC_CHR_VALS)
++
++
++class BitWriter:
++    def __init__(self):
++        self.out, self.acc, self.n = bytearray(), 0, 0
++
++    def bits(self, code, length):
++        for i in range(length - 1, -1, -1):
++            self.acc = (self.acc << 1) | ((code >> i) & 1)
++            self.n += 1
++            if self.n == 8:
++                self.out.append(self.acc)
++                if self.acc == 0xFF:
++                    self.out.append(0x00)  # byte stuffing
++                self.acc, self.n = 0, 0
++
++    def flush(self):
++        if self.n:
++            pad = 8 - self.n
++            self.bits((1 << pad) - 1, pad)  # pad with ones
++
++
++def category(v):
++    if v == 0:
++        return 0, 0
++    cat = int(abs(v)).bit_length()
++    return cat, (v + (1 << cat) - 1) if v < 0 else v
++
++
++def encode_block(bw, zz, dc_tab, ac_tab):
++    cat, code = category(zz[0])
++    bw.bits(*dc_tab[cat])
++    bw.bits(code, cat)
++    run = 0
++    for v in zz[1:]:
++        if v == 0:
++            run += 1
++            continue
++        while run > 15:
++            bw.bits(*ac_tab[0xF0])
++            run -= 16
++        cat, code = category(v)
++        bw.bits(*ac_tab[(run << 4) | cat])
++        bw.bits(code, cat)
++        run = 0
++    if run:
++        bw.bits(*ac_tab[0x00])
++
++
++def dct_quant(block, recip):
++    """Naive separable DCT with sequential accumulation, as in naive_dct()."""
++    s = block - 128.0
++    tmp = np.zeros((8, 8))
++    for k in range(8):                       # tmp[r][c] = sum_k s[r][k] * M[c][k]
++        tmp = tmp + s[:, k:k + 1] * DCT_M[:, k][None, :]
++    out = np.zeros((8, 8))
++    for k in range(8):                       # out[r][c] = sum_k M[r][k] * tmp[k][c]
++        out = out + DCT_M[:, k:k + 1] * tmp[k:k + 1, :]
++    return np.rint(out.reshape(64) * recip).astype(int)  # round-half-even = nearbyint
++
++
++def headers(w, h):
++    o = bytearray(b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x48\x00\x48\x00\x00")
++    for tid, q in ((0, Q_LUM), (1, Q_CHR)):
++        o += bytes([0xFF, 0xDB, 0x00, 0x43, tid]) + bytes(q[z] for z in ZIGZAG)
++    for bits, vals, tc in ((DC_LUM_BITS, DC_VALS, 0x00), (AC_LUM_BITS, AC_LUM_VALS, 0x10),
++                           (DC_CHR_BITS, DC_VALS, 0x01), (AC_CHR_BITS, AC_CHR_VALS, 0x11)):
++        n = 2 + 1 + 16 + len(vals)
++        o += bytes([0xFF, 0xC4, n >> 8, n & 0xFF, tc]) + bytes(bits) + bytes(vals)
++    o += bytes([0xFF, 0xC0, 0x00, 0x11, 0x08, h >> 8, h & 0xFF, w >> 8, w & 0xFF, 0x03,
++                0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01])
++    o += bytes([0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00])
++    return o
++
++
++def encode(rgb):
++    """rgb: HxWx3 uint8 array, H and W multiples of 16."""
++    h, w, _ = rgb.shape
++    assert h % 16 == 0 and w % 16 == 0, "image dimensions must be multiples of 16"
++    px = rgb.astype(np.float64)
++    R, G, B = px[..., 0], px[..., 1], px[..., 2]
++    Y = 0.299 * R + 0.587 * G + 0.114 * B
++    Cb = 0.564 * (B - Y) + 128.0
++    Cr = 0.713 * (R - Y) + 128.0
++    bw, prev = BitWriter(), [0, 0, 0]
++    for my in range(0, h, 16):
++        for mx in range(0, w, 16):
++            blocks = []
++            for by, bx in ((0, 0), (0, 8), (8, 0), (8, 8)):
++                blocks.append((0, Y[my + by:my + by + 8, mx + bx:mx + bx + 8]))
++            for comp, plane in ((1, Cb), (2, Cr)):
++                t = plane[my:my + 16, mx:mx + 16]
++                sub = (((t[0::2, 0::2] + t[0::2, 1::2]) + t[1::2, 0::2]) + t[1::2, 1::2]) * 0.25
++                blocks.append((comp, sub))
++            for comp, blk in blocks:
++                q = dct_quant(blk, RECIP_LUM if comp == 0 else RECIP_CHR)
++                zz = [int(q[z]) for z in ZIGZAG]
++                dc = zz[0]
++                zz[0], prev[comp] = dc - prev[comp], dc
++                if comp == 0:
++                    encode_block(bw, zz, DC_LUM, AC_LUM)
++                else:
++                    encode_block(bw, zz, DC_CHR, AC_CHR)
++    bw.flush()
++    return bytes(headers(w, h) + bw.out + b"\xFF\xD9")
++
++
++def load_header(path):
++    s = open(path).read()
++    w = int(re.search(r"IMG_WIDTH\s+(\d+)", s).group(1))
++    h = int(re.search(r"IMG_HEIGHT\s+(\d+)", s).group(1))
++    body = re.search(r"\{([^}]*)\}", s).group(1)
++    vals = [int(x) for x in re.findall(r"\d+", body)]
++    return np.array(vals, dtype=np.uint8).reshape(h, w, 3)
++
++
++def hex_from_log(path):
++    s = open(path, errors="replace").read()
++    m = re.search(r"START JPEG HEX DUMP[^\n]*\n(.*?)--- END JPEG HEX DUMP", s, re.S)
++    if not m:
++        sys.exit(f"no hex dump found in {path}")
++    return bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", m.group(1)))
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__,
++                                formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("image", nargs="?", help="input image (PNG etc.)")
++    p.add_argument("--header", help="read pixels from an image_data.h instead")
++    p.add_argument("-o", "--output", help="write the reference JPEG here")
++    p.add_argument("--compare", help="simulator log containing a JPEG hex dump")
++    a = p.parse_args()
++    if a.header:
++        rgb = load_header(a.header)
++    else:
++        from PIL import Image
++        rgb = np.array(Image.open(a.image).convert("RGB"))
++    ref = encode(rgb)
++    print(f"reference: {rgb.shape[1]}x{rgb.shape[0]}, {len(ref)} bytes")
++    if a.output:
++        open(a.output, "wb").write(ref)
++    if a.compare:
++        sim = hex_from_log(a.compare)
++        if sim == ref:
++            print(f"MATCH: simulator output is byte-identical ({len(sim)} bytes)")
++            return 0
++        n = min(len(sim), len(ref))
++        diff = next((i for i in range(n) if sim[i] != ref[i]), n)
++        print(f"DIFFER: simulator {len(sim)} bytes, reference {len(ref)} bytes, "
++              f"first difference at byte {diff}")
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/sw/kernels/misc/jpeg/scripts/verify.py b/sw/kernels/misc/jpeg/scripts/verify.py
+new file mode 100755
+index 0000000..99dc2da
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/scripts/verify.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++# Copyright 2026 Dimosthenis Karamparpas
++# SPDX-License-Identifier: Apache-2.0
++"""Run the JPEG kernel and compare its bitstream with the golden model."""
++
++import sys
++
++import numpy as np
++
++from jpeg_golden import encode
++from snitch.util.sim.verif_utils import Verifier
++
++
++class JpegVerifier(Verifier):
++
++    OUTPUT_UIDS = ['jpeg_out', 'jpeg_size']
++
++    def parser(self):
++        p = super().parser()
++        p.add_argument('--save-jpeg', help='Also write the produced JPEG to this file')
++        return p
++
++    def get_actual_results(self):
++        size = int(self.get_output_from_symbol('jpeg_size', 'uint32_t')[0])
++        data = self.get_output_from_symbol('jpeg_out', 'uint8_t')[:size]
++        if self.args.save_jpeg:
++            open(self.args.save_jpeg, 'wb').write(bytes(data))
++        return np.asarray(data, dtype=np.uint8)
++
++    def get_expected_results(self):
++        width = int(self.get_input_from_symbol('img_width', 'uint32_t')[0])
++        height = int(self.get_input_from_symbol('img_height', 'uint32_t')[0])
++        image = self.get_input_from_symbol('image', 'uint8_t').reshape(height, width, 3)
++        return np.frombuffer(encode(image), dtype=np.uint8)
++
++    def check_results(self, actual, expected):
++        if len(actual) != len(expected):
++            print(f'JPEG size mismatch: got {len(actual)} bytes, expected {len(expected)}')
++            return 1
++        mismatches = np.flatnonzero(actual != expected)
++        if mismatches.size:
++            print(f'{mismatches.size} bytes differ, first at offset {mismatches[0]}')
++            return 1
++        print(f'JPEG bitstream matches the golden model ({len(actual)} bytes)')
++        return 0
++
++
++if __name__ == '__main__':
++    sys.exit(JpegVerifier().main())
+diff --git a/sw/kernels/misc/jpeg/src/jpeg.h b/sw/kernels/misc/jpeg/src/jpeg.h
+new file mode 100644
+index 0000000..49110b7
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/src/jpeg.h
+@@ -0,0 +1,585 @@
++// Copyright 2026 Dimosthenis Karamparpas
++// SPDX-License-Identifier: Apache-2.0
++//
++// Baseline JPEG encoder kernels for Snitch (FP64, SSR/ISSR + FREP + copift).
++// Stages: RGB->YCbCr, 4:2:0 subsampling, 8x8 2D-DCT, quantization (quality 50),
++// zig-zag + DC DPCM, Huffman coding with the standard JPEG tables.
++
++#pragma once
++
++#include <stdint.h>
++
++#include "snrt.h"
++
++/* --- Configuration & Macros --- */
++#define BANK_SIZE 8
++#define NUM_BANKS 32
++#define ROW_SIZE (NUM_BANKS * BANK_SIZE)
++
++#define ALIGN_UP_TCDM(addr) ((((addr) + ROW_SIZE - 1) / ROW_SIZE) * ROW_SIZE)
++
++/* --- Fixed dimensions of a standard 4:2:0 MCU --- */
++#define MCU_W 16
++#define MCU_H 16
++#define MCU_TOTAL_PIXELS (MCU_W * MCU_H)          // Always 256
++#define MCU_CHROMA_PIXELS (MCU_TOTAL_PIXELS / 4)  // Always 64
++
++#define MAX(a, b) (((a) > (b)) ? (a) : (b))
++#define MIN(a, b) (((a) < (b)) ? (a) : (b))
++#define CLIP(n, min, max) MIN((MAX((n), (min))), (max))
++
++/* --- Constant DCT & quantization tables (L2) --- */
++const double dct_m_l2[8][8] __attribute__((aligned(64))) = {
++    {0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553,
++     0.353553},
++    {0.490393, 0.415735, 0.277785, 0.097545, -0.097545, -0.277785, -0.415735,
++     -0.490393},
++    {0.461940, 0.191342, -0.191342, -0.461940, -0.461940, -0.191342, 0.191342,
++     0.461940},
++    {0.415735, -0.097545, -0.490393, -0.277785, 0.277785, 0.490393, 0.097545,
++     -0.415735},
++    {0.353553, -0.353553, -0.353553, 0.353553, 0.353553, -0.353553, -0.353553,
++     0.353553},
++    {0.277785, -0.490393, 0.097545, 0.415735, -0.415735, -0.097545, 0.490393,
++     -0.277785},
++    {0.191342, -0.461940, 0.461940, -0.191342, -0.191342, 0.461940, -0.461940,
++     0.191342},
++    {0.097545, -0.277785, 0.415735, -0.490393, 0.490393, -0.415735, 0.277785,
++     -0.097545}};
++
++const double quant_recip_lum_l2[64] __attribute__((aligned(64))) = {
++    0.062500, 0.090909, 0.100000, 0.062500, 0.041667, 0.025000, 0.019608,
++    0.016393, 0.083333, 0.083333, 0.071429, 0.052632, 0.038462, 0.018182,
++    0.017544, 0.014493, 0.071429, 0.076923, 0.062500, 0.038462, 0.025000,
++    0.017544, 0.014493, 0.012048, 0.071429, 0.058824, 0.045455, 0.029412,
++    0.018182, 0.010417, 0.011364, 0.013158, 0.055556, 0.045455, 0.027027,
++    0.017857, 0.014706, 0.009009, 0.009709, 0.011236, 0.041667, 0.028571,
++    0.018182, 0.015625, 0.011364, 0.009434, 0.008850, 0.010101, 0.020408,
++    0.015625, 0.012500, 0.011111, 0.009174, 0.007812, 0.007752, 0.009259,
++    0.013889, 0.010870, 0.010526, 0.010309, 0.009009, 0.007937, 0.008065,
++    0.009434};
++
++const double quant_recip_chr_l2[64] __attribute__((aligned(64))) = {
++    0.058824, 0.055556, 0.041667, 0.021277, 0.010101, 0.010101, 0.010101,
++    0.010101, 0.055556, 0.047619, 0.038462, 0.015152, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.041667, 0.038462, 0.017857, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.021277, 0.015152, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101,
++    0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101, 0.010101,
++    0.010101};
++
++/* Quantization tables (integers, for the DQT headers) */
++int luma_quantizer[64] = {
++    16, 11, 10, 16, 24,  40,  51,  61,  12, 12, 14, 19, 26,  58,  60,  55,
++    14, 13, 16, 24, 40,  57,  69,  56,  14, 17, 22, 29, 51,  87,  80,  62,
++    18, 22, 37, 56, 68,  109, 103, 77,  24, 35, 55, 64, 81,  104, 113, 92,
++    49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99};
++
++int chroma_quantizer[64] = {17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99,
++                            99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66,
++                            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
++                            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
++                            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
++
++/* Standard JPEG Zig-Zag Map */
++const uint8_t zigzag_map[64] = {
++    0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
++    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
++    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
++
++// ========================================================================
++// STANDARD HUFFMAN TABLES
++// ========================================================================
++const uint16_t std_luma_dc_code[12] = {0,  2,  3,  4,   5,   6,
++                                       14, 30, 62, 126, 254, 510};
++const uint8_t std_luma_dc_len[12] = {2, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9};
++const uint8_t std_luma_dc_bits[16] = {0, 1, 5, 1, 1, 1, 1, 1,
++                                      1, 0, 0, 0, 0, 0, 0, 0};
++const uint8_t std_luma_dc_vals[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
++
++const uint16_t std_chroma_dc_code[12] = {0,  1,   2,   6,   14,   30,
++                                         62, 126, 254, 510, 1022, 2046};
++const uint8_t std_chroma_dc_len[12] = {2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
++const uint8_t std_chroma_dc_bits[16] = {0, 3, 1, 1, 1, 1, 1, 1,
++                                        1, 1, 1, 0, 0, 0, 0, 0};
++const uint8_t std_chroma_dc_vals[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
++
++uint16_t std_luma_ac_code[256];
++uint8_t std_luma_ac_len[256];
++uint16_t std_chroma_ac_code[256];
++uint8_t std_chroma_ac_len[256];
++
++const uint8_t luma_ac_bits[16] = {0, 2, 1, 3, 3, 2, 4, 3,
++                                  5, 5, 4, 4, 0, 0, 1, 125};
++const uint8_t luma_ac_vals[162] = {
++    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
++    0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
++    0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72,
++    0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
++    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
++    0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
++    0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
++    0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
++    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3,
++    0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
++    0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9,
++    0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
++    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4,
++    0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
++
++const uint8_t chroma_ac_bits[16] = {0, 2, 1, 2, 4, 4, 3, 4,
++                                    7, 5, 4, 4, 0, 1, 2, 119};
++const uint8_t chroma_ac_vals[162] = {
++    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41,
++    0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
++    0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1,
++    0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
++    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44,
++    0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
++    0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74,
++    0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
++    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
++    0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
++    0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
++    0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
++    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4,
++    0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
++
++void init_standard_ac_tables() {
++    int code = 0, k = 0;
++    for (int len = 1; len <= 16; len++) {
++        for (int i = 0; i < luma_ac_bits[len - 1]; i++) {
++            uint8_t sym = luma_ac_vals[k++];
++            std_luma_ac_code[sym] = code++;
++            std_luma_ac_len[sym] = len;
++        }
++        code <<= 1;
++    }
++    code = 0;
++    k = 0;
++    for (int len = 1; len <= 16; len++) {
++        for (int i = 0; i < chroma_ac_bits[len - 1]; i++) {
++            uint8_t sym = chroma_ac_vals[k++];
++            std_chroma_ac_code[sym] = code++;
++            std_chroma_ac_len[sym] = len;
++        }
++        code <<= 1;
++    }
++}
++
++/* --- Bit-writer (32-bit safe, 8-bit accumulator) --- */
++typedef struct {
++    uint8_t *jpeg_output;
++    uint32_t byte_pos;
++    uint8_t bit_buffer;
++    int32_t num_bits;
++} BitWriter;
++
++void init_bit_writer(BitWriter *writer, uint8_t *target_payload) {
++    writer->jpeg_output = target_payload;
++    writer->byte_pos = 0;
++    writer->bit_buffer = 0;
++    writer->num_bits = 0;
++}
++
++void write_byte_out(BitWriter *w, uint8_t val) {
++    w->jpeg_output[w->byte_pos++] = val;
++}
++
++void write_bits(BitWriter *writer, uint32_t code, int bits) {
++    if (bits == 0) return;
++    code &= (1U << bits) - 1;
++
++    for (int i = bits - 1; i >= 0; i--) {
++        int bit = (code >> i) & 1;
++        writer->bit_buffer = (writer->bit_buffer << 1) | bit;
++        writer->num_bits++;
++
++        if (writer->num_bits == 8) {
++            uint8_t byte = writer->bit_buffer;
++            writer->jpeg_output[writer->byte_pos++] = byte;
++            if (byte == 0xFF) {
++                writer->jpeg_output[writer->byte_pos++] = 0x00;
++            }
++            writer->bit_buffer = 0;
++            writer->num_bits = 0;
++        }
++    }
++}
++
++void flush_bit_writer(BitWriter *writer) {
++    if (writer->num_bits > 0) {
++        int missing_bits = 8 - writer->num_bits;
++        uint8_t padded_byte =
++            (writer->bit_buffer << missing_bits) | ((1 << missing_bits) - 1);
++        writer->jpeg_output[writer->byte_pos++] = padded_byte;
++        if (padded_byte == 0xFF) {
++            writer->jpeg_output[writer->byte_pos++] = 0x00;
++        }
++        writer->bit_buffer = 0;
++        writer->num_bits = 0;
++    }
++}
++
++void get_huffman_category(int val, int *category, int *code) {
++    if (val == 0) {
++        *category = 0;
++        *code = 0;
++        return;
++    }
++    int abs_val = (val < 0) ? -val : val;
++    int cat = 0;
++    while (abs_val > 0) {
++        cat++;
++        abs_val >>= 1;
++    }
++    *category = cat;
++    if (val < 0)
++        *code = val + (1 << cat) - 1;
++    else
++        *code = val;
++}
++
++void write_dht_marker(BitWriter *w, const uint8_t bits[], const uint8_t vals[],
++                      int num_vals, int tc_th) {
++    int length = 2 + 1 + 16 + num_vals;
++    write_byte_out(w, 0xFF);
++    write_byte_out(w, 0xC4);
++    write_byte_out(w, (length >> 8) & 0xFF);
++    write_byte_out(w, length & 0xFF);
++    write_byte_out(w, tc_th);
++    for (int i = 0; i < 16; i++) write_byte_out(w, bits[i]);
++    for (int i = 0; i < num_vals; i++) write_byte_out(w, vals[i]);
++}
++
++void opt_zigzag_and_diff(const double *in_blocks, int16_t *out_blocks,
++                         int *prev_dc, int num_blocks,
++                         const uint8_t *zigzag_map) {
++    for (int b = 0; b < num_blocks; b++) {
++        const double *in = &in_blocks[b * 64];
++        int16_t *out = &out_blocks[b * 64];
++
++        // Configure Indexed SSR: Address Generation Unit (AGU) automatically fetches
++        // `in[zigzag_map[0]]`, `in[zigzag_map[1]]`... directly into the FPU
++        snrt_issr_read(SNRT_SSR_DM0, (void *)in, (void *)zigzag_map, 64,
++                       SNRT_SSR_IDXSIZE_U8);
++        snrt_ssr_enable();
++
++        int32_t val;
++
++        // Unleash the FPU to convert all 64 floats to ints and push them into the FIFO queue
++        asm volatile(
++            "mv        t6, x0          \n"  // Clear t6
++            "csrsi     copift, 0x1     \n"  // Enable F2I (Float-to-Int) hardware queues
++            "frep.o    %[n], 1, 0, 0   \n"  // Unroll FPU operation 64 times
++            "fcvt.w.d  t6, ft0         \n"  // FPU: pop SSR(ft0), cast to int, push to queue(t6)
++            "mv        %[val], t6      \n"  // CPU: wait and pop the first value (DC)
++            : [ val ] "=r"(val)
++            : [ n ] "r"(63)
++            : "t6", "ft0", "memory");
++
++        // 1. Process DC component (ALU doesn't wait for memory, it pops from queue)
++        int current_dc = val;
++        out[0] = (int16_t)(current_dc - *prev_dc);
++        *prev_dc = current_dc;
++
++        // 2. Process AC components
++        for (int i = 1; i < 64; i++) {
++            asm volatile("mv %[val], t6 \n"
++                         : [ val ] "=r"(val)
++                         :
++                         : "t6");  // Pop from F2I queue
++            out[i] = (int16_t)val;
++        }
++
++        asm volatile("csrci copift, 0x1 \n" ::: "memory");  // Disable queues
++        snrt_fpu_fence();
++        snrt_ssr_disable();
++    }
++}
++
++void naive_huffman_rle_encode_block(int16_t *zigzag_block, BitWriter *writer,
++                                    int is_chroma) {
++    int category, v_code;
++
++    get_huffman_category(zigzag_block[0], &category, &v_code);
++    if (!is_chroma)
++        write_bits(writer, std_luma_dc_code[category],
++                   std_luma_dc_len[category]);
++    else
++        write_bits(writer, std_chroma_dc_code[category],
++                   std_chroma_dc_len[category]);
++    write_bits(writer, v_code, category);
++
++    int r = 0;
++    int16_t cur = zigzag_block[1];  // prime the pipeline
++    for (int i = 1; i < 64; i++) {
++        int16_t next =
++            (i + 1 < 64) ? zigzag_block[i + 1] : 0;  // issue next load early
++
++        if (cur == 0) {
++            r++;
++        } else {
++            while (r > 15) {
++                if (!is_chroma)
++                    write_bits(writer, std_luma_ac_code[0xF0],
++                               std_luma_ac_len[0xF0]);
++                else
++                    write_bits(writer, std_chroma_ac_code[0xF0],
++                               std_chroma_ac_len[0xF0]);
++                r -= 16;
++            }
++            get_huffman_category(cur, &category, &v_code);
++            uint8_t rs_sym = (r << 4) | category;
++            if (!is_chroma)
++                write_bits(writer, std_luma_ac_code[rs_sym],
++                           std_luma_ac_len[rs_sym]);
++            else
++                write_bits(writer, std_chroma_ac_code[rs_sym],
++                           std_chroma_ac_len[rs_sym]);
++            write_bits(writer, v_code, category);
++            r = 0;
++        }
++        cur = next;
++    }
++    if (r > 0) {
++        if (!is_chroma)
++            write_bits(writer, std_luma_ac_code[0x00], std_luma_ac_len[0x00]);
++        else
++            write_bits(writer, std_chroma_ac_code[0x00],
++                       std_chroma_ac_len[0x00]);
++    }
++}
++
++// ========================================================================
++// OPTIMIZED ASSEMBLY + SSR PIPELINE STAGES
++// ========================================================================
++void opt_YCBCR_conversion(uint8_t *input_idx, double *out_Y, double *out_CbCr,
++                          double *lut, int total_pixels) {
++    register double r_c_r asm("ft3") = 0.299;
++    register double r_c_g asm("ft4") = 0.587;
++    register double r_c_b asm("ft5") = 0.114;
++    register double r_c_cb asm("ft6") = 0.564;
++    register double r_c_cr asm("ft7") = 0.713;
++
++    snrt_issr_read(SNRT_SSR_DM0, lut, input_idx, total_pixels * 3,
++                   SNRT_SSR_IDXSIZE_U8);
++    snrt_ssr_loop_4d(SNRT_SSR_DM1, 8, 2, 8, 2, 8, 8 * 8 * 8, 8 * 8, 1024);
++    snrt_ssr_write(SNRT_SSR_DM1, SNRT_SSR_4D, out_Y);
++    snrt_ssr_loop_1d(SNRT_SSR_DM2, total_pixels * 2, sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, out_CbCr);
++    snrt_ssr_enable();
++
++    asm volatile(
++        "frep.o %[n], 22, 0, 0            \n"
++        "fmv.d ft8,  ft0                  \n"
++        "fmv.d ft9,  ft0                  \n"
++        "fmv.d ft10, ft0                  \n"
++        "fmv.d ft11, ft0                  \n"
++        "fmv.d f8,   ft0                  \n"
++        "fmv.d f9,   ft0                  \n"
++        "fmul.d f10, %[c_r], ft8          \n"
++        "fmul.d f11, %[c_r], ft11         \n"
++        "fmadd.d f10, %[c_g], ft9,  f10   \n"
++        "fmadd.d f11, %[c_g], f8,   f11   \n"
++        "fmadd.d f10, %[c_b], ft10, f10   \n"
++        "fmadd.d f11, %[c_b], f9,   f11   \n"
++        "fmv.d ft1, f10                   \n"
++        "fmv.d ft1, f11                   \n"
++        "fsub.d ft10, ft10, f10           \n"
++        "fsub.d f9,   f9,   f11           \n"
++        "fsub.d ft8,  ft8,  f10           \n"
++        "fsub.d ft11, ft11, f11           \n"
++        "fmul.d ft2, %[c_cb], ft10        \n"
++        "fmul.d ft2, %[c_cr], ft8         \n"
++        "fmul.d ft2, %[c_cb], f9          \n"
++        "fmul.d ft2, %[c_cr], ft11        \n"
++        :
++        : [ n ] "r"(total_pixels / 2 - 1), [ c_r ] "f"(r_c_r),
++          [ c_g ] "f"(r_c_g), [ c_b ] "f"(r_c_b), [ c_cb ] "f"(r_c_cb),
++          [ c_cr ] "f"(r_c_cr)
++        : "ft0", "ft1", "ft2", "ft8", "ft9", "ft10", "ft11", "f8", "f9", "f10",
++          "f11", "memory");
++
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++}
++
++void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f,
++                           int w, int h) {
++    register double quarter asm("ft11") = 0.25;
++    double c_128 = 128.0;
++
++    snrt_ssr_loop_4d(SNRT_SSR_DM0, 4, 2, 8, 8, 8, 32 * 8, 32, 32 * 8 * 2);
++    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_4D, in_cbcr);
++    snrt_ssr_loop_1d(SNRT_SSR_DM1, (w / 2) * (h / 2), sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM1, SNRT_SSR_1D, out_cb_f);
++    snrt_ssr_loop_1d(SNRT_SSR_DM2, (w / 2) * (h / 2), sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, out_cr_f);
++
++    snrt_ssr_enable();
++
++#ifdef SNRT_SUPPORTS_FREP
++    asm volatile(
++        "frep.o %[total_blocks], 16, 0, 0 \n"
++        "fmv.d  ft8,  ft0 \n"
++        "fmv.d  ft9,  ft0 \n"
++        "fmv.d  ft3,  ft0 \n"
++        "fmv.d  ft10, ft0 \n"
++        "fmv.d  ft4,  ft0 \n"
++        "fmv.d  ft7,  ft0 \n"
++        "fmv.d  ft5,  ft0 \n"
++        "fmv.d  ft6,  ft0 \n"
++        "fadd.d ft8, ft8, ft3 \n"
++        "fadd.d ft9, ft9, ft10 \n"
++        "fadd.d ft4, ft4, ft5 \n"
++        "fadd.d ft7, ft7, ft6 \n"
++        "fadd.d ft8, ft8, ft4 \n"
++        "fadd.d ft9, ft9, ft7 \n"
++        "fmadd.d ft1, ft8, %[q], %[c_128] \n"
++        "fmadd.d ft2, ft9, %[q], %[c_128] \n"
++        :
++        : [ total_blocks ] "r"((w / 2 * h / 2) - 1), [ q ] "f"(quarter),
++          [ c_128 ] "f"(c_128)
++        : "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9",
++          "ft10", "memory");
++#endif
++
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++}
++
++void opt_dct_forward(double *in, double *out, const double *dct_m) {
++    register double offset asm("ft3") = -128;
++
++    // STAGE 0: Level Shift
++    snrt_ssr_loop_1d(SNRT_SSR_DM0, 64, sizeof(double));
++    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_1D, (void *)in);
++    snrt_ssr_loop_1d(SNRT_SSR_DM1, 64, sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM1, SNRT_SSR_1D, (void *)out);
++    snrt_ssr_enable();
++    asm volatile(
++        "frep.o %[n], 1, 0, 0 \n"
++        "fadd.d ft1, ft0, %[offset] \n"
++        :
++        : [ n ] "r"(63), [ offset ] "f"(offset)
++        : "ft0", "ft1", "memory");
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++
++    // STAGE 1: Pass 1 - Rows
++    snrt_ssr_loop_4d(SNRT_SSR_DM0, 8, 8, 1, 8, 0, 8, 0, 64);
++    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_4D, (void *)out);
++    snrt_ssr_loop_4d(SNRT_SSR_DM1, 8, 8, 1, 8, 64, 8, 128, 0);
++    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_4D, (void *)dct_m);
++    snrt_ssr_loop_1d(SNRT_SSR_DM2, 64, sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, (void *)in);
++    snrt_ssr_enable();
++    asm volatile(
++        "frep.o %[cnts], 24, 0, 0 \n"
++        "fsub.d f3, f3, f3 \n"
++        "fsub.d f4, f4, f4 \n"
++        "fsub.d f5, f5, f5 \n"
++        "fsub.d f6, f6, f6 \n"
++        "fsub.d f7, f7, f7 \n"
++        "fsub.d f28, f28, f28 \n"
++        "fsub.d f29, f29, f29 \n"
++        "fsub.d f30, f30, f30 \n"
++        "frep.o %[cnt], 8, 0, 0 \n"
++        "fmadd.d f3, f0, f1, f3 \n"
++        "fmadd.d f4, f0, f1, f4 \n"
++        "fmadd.d f5, f0, f1, f5 \n"
++        "fmadd.d f6, f0, f1, f6 \n"
++        "fmadd.d f7, f0, f1, f7 \n"
++        "fmadd.d f28, f0, f1, f28 \n"
++        "fmadd.d f29, f0, f1, f29 \n"
++        "fmadd.d f30, f0, f1, f30 \n"
++        "fmadd.d f2, f0, f1, f3 \n"
++        "fmadd.d f2, f0, f1, f4 \n"
++        "fmadd.d f2, f0, f1, f5 \n"
++        "fmadd.d f2, f0, f1, f6 \n"
++        "fmadd.d f2, f0, f1, f7 \n"
++        "fmadd.d f2, f0, f1, f28 \n"
++        "fmadd.d f2, f0, f1, f29 \n"
++        "fmadd.d f2, f0, f1, f30 \n"
++        :
++        : [ cnt ] "r"(6), [ cnts ] "r"(7)
++        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f28", "f29", "f30",
++          "memory");
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++
++    // STAGE 2: Pass 2 - Columns
++    snrt_ssr_loop_4d(SNRT_SSR_DM0, 8, 8, 1, 8, 0, 8, 0, 64);
++    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_4D, (void *)dct_m);
++    snrt_ssr_loop_4d(SNRT_SSR_DM1, 8, 8, 1, 8, 8, 64, 16, 0);
++    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_4D, (void *)in);
++    snrt_ssr_loop_1d(SNRT_SSR_DM2, 64, sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, (void *)out);
++    snrt_ssr_enable();
++    asm volatile(
++        "frep.o %[cnts], 24, 0, 0 \n"
++        "fsub.d f3, f3, f3 \n"
++        "fsub.d f4, f4, f4 \n"
++        "fsub.d f5, f5, f5 \n"
++        "fsub.d f6, f6, f6 \n"
++        "fsub.d f7, f7, f7 \n"
++        "fsub.d f28, f28, f28 \n"
++        "fsub.d f29, f29, f29 \n"
++        "fsub.d f30, f30, f30 \n"
++        "frep.o %[cnt], 8, 0, 0 \n"
++        "fmadd.d f3, f0, f1, f3 \n"
++        "fmadd.d f4, f0, f1, f4 \n"
++        "fmadd.d f5, f0, f1, f5 \n"
++        "fmadd.d f6, f0, f1, f6 \n"
++        "fmadd.d f7, f0, f1, f7 \n"
++        "fmadd.d f28, f0, f1, f28 \n"
++        "fmadd.d f29, f0, f1, f29 \n"
++        "fmadd.d f30, f0, f1, f30 \n"
++        "fmadd.d f2, f0, f1, f3 \n"
++        "fmadd.d f2, f0, f1, f4 \n"
++        "fmadd.d f2, f0, f1, f5 \n"
++        "fmadd.d f2, f0, f1, f6 \n"
++        "fmadd.d f2, f0, f1, f7 \n"
++        "fmadd.d f2, f0, f1, f28 \n"
++        "fmadd.d f2, f0, f1, f29 \n"
++        "fmadd.d f2, f0, f1, f30 \n"
++        :
++        : [ cnt ] "r"(6), [ cnts ] "r"(7)
++        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f28", "f29", "f30",
++          "memory");
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++}
++
++void opt_quant(double *in, double *out, const double *recip) {
++    register double magic asm("ft10") = 6755399441055744.0;
++
++    snrt_ssr_loop_1d(SNRT_SSR_DM0, 64, sizeof(double));
++    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_1D, (void *)in);
++    snrt_ssr_loop_1d(SNRT_SSR_DM1, 64, sizeof(double));
++    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_1D, (void *)recip);
++    snrt_ssr_loop_1d(SNRT_SSR_DM2, 64, sizeof(double));
++    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, (void *)out);
++
++    snrt_ssr_enable();
++    asm volatile(
++        "frep.o %[cnt], 6, 0, 0    \n"
++        "fmul.d  ft3, ft0, ft1     \n"
++        "fmul.d  ft4, ft0, ft1     \n"
++        "fadd.d  ft5, ft3, ft10, rne \n"
++        "fadd.d  ft6, ft4, ft10, rne \n"
++        "fsub.d  ft2, ft5, ft10, rne \n"
++        "fsub.d  ft2, ft6, ft10, rne \n"
++        :
++        : [ cnt ] "r"(31), "f"(magic)
++        : "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6",
++          "memory"  // ft10 holds the magic constant (input)
++    );
++    snrt_fpu_fence();
++    snrt_ssr_disable();
++}
+diff --git a/sw/kernels/misc/jpeg/src/main.c b/sw/kernels/misc/jpeg/src/main.c
+new file mode 100644
+index 0000000..de88458
+--- /dev/null
++++ b/sw/kernels/misc/jpeg/src/main.c
+@@ -0,0 +1,246 @@
++// Copyright 2026 Dimosthenis Karamparpas
++// SPDX-License-Identifier: Apache-2.0
++//
++// Baseline JPEG encoder on one Snitch compute core, fed by the DM core.
++//
++// The DM core streams one 16x16 RGB tile (one 4:2:0 MCU) at a time from
++// `image` (L3) into TCDM with a 2-D DMA transfer. Compute core 0 runs the
++// six pipeline stages on the tile and appends the Huffman-coded bits to an
++// L1 payload buffer, which the DM core flushes to `jpeg_out` (L3) after
++// every MCU. On exit, `jpeg_out[0 .. jpeg_size)` holds a complete JFIF file.
++
++#include <stdint.h>
++
++#include "data.h"
++#include "jpeg.h"
++#include "snrt.h"
++
++#define PAYLOAD_BYTES 4096
++
++static void write_jpeg_headers(BitWriter *w, uint16_t width, uint16_t height) {
++    // SOI + APP0 (JFIF)
++    static const uint8_t soi_app0[20] = {
++        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46,
++        0x00, 0x01, 0x01, 0x00, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00};
++    for (int i = 0; i < 20; i++) write_byte_out(w, soi_app0[i]);
++
++    // DQT: luma (table 0) and chroma (table 1), in zig-zag order
++    write_byte_out(w, 0xFF);
++    write_byte_out(w, 0xDB);
++    write_byte_out(w, 0x00);
++    write_byte_out(w, 0x43);
++    write_byte_out(w, 0x00);
++    for (int i = 0; i < 64; i++)
++        write_byte_out(w, (uint8_t)luma_quantizer[zigzag_map[i]]);
++    write_byte_out(w, 0xFF);
++    write_byte_out(w, 0xDB);
++    write_byte_out(w, 0x00);
++    write_byte_out(w, 0x43);
++    write_byte_out(w, 0x01);
++    for (int i = 0; i < 64; i++)
++        write_byte_out(w, (uint8_t)chroma_quantizer[zigzag_map[i]]);
++
++    // DHT: standard DC/AC tables for luma and chroma
++    write_dht_marker(w, std_luma_dc_bits, std_luma_dc_vals, 0x0C, 0x00);
++    write_dht_marker(w, luma_ac_bits, luma_ac_vals, 0xA2, 0x10);
++    write_dht_marker(w, std_chroma_dc_bits, std_chroma_dc_vals, 0x0C, 0x01);
++    write_dht_marker(w, chroma_ac_bits, chroma_ac_vals, 0xA2, 0x11);
++
++    // SOF0: 8-bit, 3 components, Y sampled 2x2, Cb/Cr 1x1 (4:2:0)
++    write_byte_out(w, 0xFF);
++    write_byte_out(w, 0xC0);
++    write_byte_out(w, 0x00);
++    write_byte_out(w, 0x11);
++    write_byte_out(w, 0x08);
++    write_byte_out(w, (height >> 8) & 0xFF);
++    write_byte_out(w, height & 0xFF);
++    write_byte_out(w, (width >> 8) & 0xFF);
++    write_byte_out(w, width & 0xFF);
++    write_byte_out(w, 0x03);
++    write_byte_out(w, 0x01);
++    write_byte_out(w, 0x22);
++    write_byte_out(w, 0x00);
++    write_byte_out(w, 0x02);
++    write_byte_out(w, 0x11);
++    write_byte_out(w, 0x01);
++    write_byte_out(w, 0x03);
++    write_byte_out(w, 0x11);
++    write_byte_out(w, 0x01);
++
++    // SOS
++    static const uint8_t sos[14] = {0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00,
++                                    0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00};
++    for (int i = 0; i < 14; i++) write_byte_out(w, sos[i]);
++}
++
++int main() {
++    const uint16_t width = img_width;
++    const uint16_t height = img_height;
++    const uint32_t mcus_wide = width / MCU_W;
++    const uint32_t total_mcus = mcus_wide * (height / MCU_H);
++    const uint32_t core_idx = snrt_cluster_core_idx();
++    const int is_worker = snrt_is_compute_core() && core_idx == 0;
++
++    // ---------------------------------------------------------------------
++    // TCDM layout (identical on all cores; only core 0 and the DM core use it)
++    // ---------------------------------------------------------------------
++    uintptr_t base = ALIGN_UP_TCDM((uintptr_t)snrt_l1_next());
++    volatile uint32_t *payload_bytes = (volatile uint32_t *)base;
++    double *lut = (double *)ALIGN_UP_TCDM(base + sizeof(uint32_t));
++    double *l1_matrix =
++        (double *)ALIGN_UP_TCDM((uintptr_t)lut + 256 * sizeof(double));
++    double *l1_recip_lum =
++        (double *)ALIGN_UP_TCDM((uintptr_t)l1_matrix + 64 * sizeof(double));
++    double *l1_recip_chr =
++        (double *)ALIGN_UP_TCDM((uintptr_t)l1_recip_lum + 64 * sizeof(double));
++    uint8_t *input_rgb =
++        (uint8_t *)ALIGN_UP_TCDM((uintptr_t)l1_recip_chr + 64 * sizeof(double));
++    double *ws_a =
++        (double *)ALIGN_UP_TCDM((uintptr_t)input_rgb + MCU_TOTAL_PIXELS * 3);
++    double *ws_b =
++        (double *)ALIGN_UP_TCDM((uintptr_t)ws_a + 384 * sizeof(double)) +
++        1;  // +8 B: different bank than ws_a
++    uint8_t *l1_zigzag =
++        (uint8_t *)ALIGN_UP_TCDM((uintptr_t)ws_b + 512 * sizeof(double));
++    uint8_t *payload = (uint8_t *)ALIGN_UP_TCDM((uintptr_t)l1_zigzag + 64);
++
++    // Buffer aliasing between stages (see thesis Section 5.2.3)
++    double *Y = ws_a, *CbCr = ws_b;        // stage 1
++    double *Cb = ws_a + MCU_TOTAL_PIXELS;  // stage 2
++    double *Cr = ws_a + MCU_TOTAL_PIXELS + MCU_CHROMA_PIXELS;
++    double *dct_Y = ws_b;  // stage 3
++    double *dct_Cb = ws_b + MCU_TOTAL_PIXELS;
++    double *dct_Cr = ws_b + MCU_TOTAL_PIXELS + MCU_CHROMA_PIXELS;
++    double *q_Y = ws_a, *q_Cb = Cb, *q_Cr = Cr;  // stage 4
++    int16_t *zz_Y = (int16_t *)ws_b;             // stage 5
++    int16_t *zz_Cb = zz_Y + MCU_TOTAL_PIXELS;
++    int16_t *zz_Cr = zz_Y + MCU_TOTAL_PIXELS + MCU_CHROMA_PIXELS;
++
++    BitWriter writer;
++    int prev_dc_Y = 0, prev_dc_Cb = 0, prev_dc_Cr = 0;
++    uint32_t out_pos = 0;  // DM core: bytes written to jpeg_out
++    uint32_t cyc[6] = {0};
++    uint32_t t0;
++
++    // Constant tables -> L1
++    if (snrt_is_dm_core()) {
++        snrt_dma_start_1d(l1_matrix, (void *)dct_m_l2, 64 * sizeof(double));
++        snrt_dma_start_1d(l1_recip_lum, (void *)quant_recip_lum_l2,
++                          64 * sizeof(double));
++        snrt_dma_start_1d(l1_recip_chr, (void *)quant_recip_chr_l2,
++                          64 * sizeof(double));
++        snrt_dma_wait_all();
++    }
++    // Initialisation and JFIF headers
++    if (is_worker) {
++        init_standard_ac_tables();
++        for (int i = 0; i < 256; i++) lut[i] = (double)i;
++        for (int i = 0; i < 64; i++) l1_zigzag[i] = zigzag_map[i];
++        init_bit_writer(&writer, payload);
++        write_jpeg_headers(&writer, width, height);
++        *payload_bytes = writer.byte_pos;
++    }
++    snrt_cluster_hw_barrier();
++
++    // Flush headers to L3
++    if (snrt_is_dm_core()) {
++        snrt_dma_start_1d(jpeg_out, payload, *payload_bytes);
++        snrt_dma_wait_all();
++        out_pos = *payload_bytes;
++    }
++    snrt_cluster_hw_barrier();
++    if (is_worker) writer.byte_pos = 0;
++
++    // ---------------------------------------------------------------------
++    // MCU streaming loop
++    // ---------------------------------------------------------------------
++    for (uint32_t mcu = 0; mcu < total_mcus; mcu++) {
++        if (snrt_is_dm_core()) {
++            uint32_t row = mcu / mcus_wide, col = mcu % mcus_wide;
++            const uint8_t *src =
++                &image[(row * MCU_H * width + col * MCU_W) * 3];
++            snrt_dma_start_2d(input_rgb, (void *)src, MCU_W * 3, MCU_W * 3,
++                              width * 3, MCU_H);
++            snrt_dma_wait_all();
++        }
++        snrt_cluster_hw_barrier();
++
++        if (is_worker) {
++            t0 = snrt_mcycle();
++            opt_YCBCR_conversion(input_rgb, Y, CbCr, lut, MCU_TOTAL_PIXELS);
++            cyc[0] += snrt_mcycle() - t0;
++
++            t0 = snrt_mcycle();
++            opt_chroma_420_2d_ssr(CbCr, Cb, Cr, MCU_W, MCU_H);
++            cyc[1] += snrt_mcycle() - t0;
++
++            t0 = snrt_mcycle();
++            for (int b = 0; b < 4; b++)
++                opt_dct_forward(&Y[b * 64], &dct_Y[b * 64], l1_matrix);
++            opt_dct_forward(Cb, dct_Cb, l1_matrix);
++            opt_dct_forward(Cr, dct_Cr, l1_matrix);
++            cyc[2] += snrt_mcycle() - t0;
++
++            t0 = snrt_mcycle();
++            for (int b = 0; b < 4; b++)
++                opt_quant(&dct_Y[b * 64], &q_Y[b * 64], l1_recip_lum);
++            opt_quant(dct_Cb, q_Cb, l1_recip_chr);
++            opt_quant(dct_Cr, q_Cr, l1_recip_chr);
++            cyc[3] += snrt_mcycle() - t0;
++
++            t0 = snrt_mcycle();
++            opt_zigzag_and_diff(q_Y, zz_Y, &prev_dc_Y, 4, l1_zigzag);
++            opt_zigzag_and_diff(q_Cb, zz_Cb, &prev_dc_Cb, 1, l1_zigzag);
++            opt_zigzag_and_diff(q_Cr, zz_Cr, &prev_dc_Cr, 1, l1_zigzag);
++            cyc[4] += snrt_mcycle() - t0;
++
++            t0 = snrt_mcycle();
++            for (int b = 0; b < 4; b++)
++                naive_huffman_rle_encode_block(&zz_Y[b * 64], &writer, 0);
++            naive_huffman_rle_encode_block(zz_Cb, &writer, 1);
++            naive_huffman_rle_encode_block(zz_Cr, &writer, 1);
++            cyc[5] += snrt_mcycle() - t0;
++
++            *payload_bytes = writer.byte_pos;
++        }
++        snrt_cluster_hw_barrier();
++
++        if (snrt_is_dm_core() && *payload_bytes > 0) {
++            snrt_dma_start_1d(&jpeg_out[out_pos], payload, *payload_bytes);
++            snrt_dma_wait_all();
++            out_pos += *payload_bytes;
++        }
++        snrt_cluster_hw_barrier();
++        if (is_worker)
++            writer.byte_pos = 0;  // partial byte stays in the bit buffer
++    }
++
++    // ---------------------------------------------------------------------
++    // Pad the last byte, append EOI and flush the tail
++    // ---------------------------------------------------------------------
++    if (is_worker) {
++        flush_bit_writer(&writer);
++        write_byte_out(&writer, 0xFF);
++        write_byte_out(&writer, 0xD9);
++        *payload_bytes = writer.byte_pos;
++    }
++    snrt_cluster_hw_barrier();
++    if (snrt_is_dm_core()) {
++        snrt_dma_start_1d(&jpeg_out[out_pos], payload, *payload_bytes);
++        snrt_dma_wait_all();
++        out_pos += *payload_bytes;
++        jpeg_size = out_pos;
++    }
++    snrt_cluster_hw_barrier();
++
++    if (is_worker) {
++        uint32_t total = 0;
++        for (int i = 0; i < 6; i++) total += cyc[i];
++        printf(
++            "JPEG %ux%u, %u MCUs: ycbcr %u, chroma %u, dct %u, quant %u, "
++            "zigzag %u, huffman %u, total %u cycles\n",
++            width, height, total_mcus, cyc[0], cyc[1], cyc[2], cyc[3], cyc[4],
++            cyc[5], total);
++    }
++    return 0;
++}
+diff --git a/test/run.yaml b/test/run.yaml
+index 89fee5f..1d52cd2 100644
+--- a/test/run.yaml
++++ b/test/run.yaml
+@@ -125,6 +125,8 @@ runs:
+     cmd: [../sw/kernels/misc/correlation/scripts/verify.py, "${sim_bin}", "${elf}"]
+   - elf: ../sw/kernels/misc/kmeans/build/kmeans.elf
+     cmd: [../sw/kernels/misc/kmeans/scripts/verify.py, --no-gui, "${sim_bin}", "${elf}"]
++  - elf: ../sw/kernels/misc/jpeg/build/jpeg.elf
++    cmd: [../sw/kernels/misc/jpeg/scripts/verify.py, "${sim_bin}", "${elf}"]
+   - elf: ../sw/kernels/misc/kbpcpa/build/kbpcpa.elf
+     cmd: [../sw/kernels/misc/kbpcpa/scripts/verify.py, "${sim_bin}", "${elf}"]
+   - elf: ../sw/kernels/misc/j3d27pt/build/j3d27pt.elf
+-- 
+2.34.1
+
